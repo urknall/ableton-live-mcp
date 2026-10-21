@@ -54,16 +54,18 @@ def _sample(steps, t, baseline=None):
     return baseline
 
 
-def test_points_mode_defaults_to_zero_length_steps():
-    assert steps_for([{"time": 0, "value": 0.5}, {"time": 2, "value": 0.7}]) == [
-        (0.0, 0.0, 0.5),
-        (2.0, 0.0, 0.7),
+def test_points_mode_defaults_to_contiguous_holds():
+    assert steps_for([{"time": 0, "value": 0.5}, {"time": 2, "value": 0.7}], hold_until=8) == [
+        (0.0, 2.0, 0.5),
+        (2.0, 6.0, 0.7),
     ]
 
 
 def test_points_mode_uses_each_points_duration():
-    steps = steps_for([{"time": 0, "value": 0.5, "duration": 4}, {"time": 4, "value": 0.7}])
-    assert steps == [(0.0, 4.0, 0.5), (4.0, 0.0, 0.7)]
+    steps = steps_for(
+        [{"time": 0, "value": 0.5, "duration": 4}, {"time": 4, "value": 0.7, "duration": 2}]
+    )
+    assert steps == [(0.0, 4.0, 0.5), (4.0, 2.0, 0.7)]
 
 
 def test_ramp_is_contiguous_linear_and_hits_both_ends():
@@ -216,11 +218,11 @@ def test_ramp_from_beat_zero_starts_the_envelope_on_its_first_value():
 @pytest.mark.parametrize(
     "points, mode",
     [
-        ([{"time": 0, "value": 0.2, "duration": 4}], "points"),
+        ([{"time": 2, "value": 0.2, "duration": 4}], "points"),
         ([{"time": 2, "value": 0.2}, {"time": 4, "value": 0.9}], "ramp"),
     ],
 )
-def test_parameter_is_left_alone_unless_a_ramp_starts_at_beat_zero(points, mode):
+def test_parameter_is_left_alone_unless_a_write_starts_at_beat_zero(points, mode):
     clip = FakeClip()
     result = write_automation(_bridge(clip), 0, 0, 0, "Filter Freq", points, mode)
     assert clip.created_from == 0.7 and result["start_value_set"] is None
@@ -241,10 +243,10 @@ def test_start_settled_reports_whether_beat_zero_reads_the_first_value():
     assert clip.envelope.value_at_time(15.999) == 120.0
 
 
-def test_start_settled_is_only_reported_for_ramps_from_beat_zero():
+def test_start_settled_is_reported_for_point_holds_from_beat_zero():
     clip = FakeClip()
     points = [{"time": 0, "value": 0.2, "duration": 4}]
-    assert write_automation(_bridge(clip), 0, 0, 0, "F", points)["start_settled"] is None
+    assert write_automation(_bridge(clip), 0, 0, 0, "F", points)["start_settled"] is True
 
 
 def test_a_parameter_that_refuses_the_start_value_still_gets_its_ramp():
@@ -262,14 +264,14 @@ def test_a_parameter_that_refuses_the_start_value_still_gets_its_ramp():
     clip = FakeClip()
     points = [{"time": 0, "value": 0.2}, {"time": 4, "value": 0.9}]
     result = write_automation(_bridge(clip, Stubborn()), 0, 0, 0, "Locked", points, "ramp")
-    assert result["start_value_set"] is None and result["start_settled"] is None
+    assert result["start_value_set"] is None and result["start_settled"] is False
     assert len(clip.envelope.steps) == 65
 
 
-def test_write_automation_default_call_is_unchanged():
+def test_write_automation_default_call_holds_to_clip_end():
     clip = FakeClip()
     write_automation(_bridge(clip), 0, 0, 0, "Filter Freq", [{"time": 1, "value": 0.5}])
-    assert clip.envelope.steps == [(1.0, 0.0, 0.5)]
+    assert clip.envelope.steps == [(1.0, 15.0, 0.5)]
 
 
 def test_invalid_write_leaves_the_existing_envelope_alone():
@@ -299,7 +301,7 @@ def test_dispatch_passes_mode_and_step_length():
     assert seen[1][5:] == ("ramp", 0.25)
 
 
-def test_tool_sends_mode_and_flags_an_outdated_remote_script(monkeypatch):
+def test_tool_sends_mode_after_checking_the_remote_script(monkeypatch):
     from ableton_live_mcp import tools as _tools  # noqa: F401
     from ableton_live_mcp.app import mcp
     from ableton_live_mcp.tools import arrangement
@@ -318,12 +320,18 @@ def test_tool_sends_mode_and_flags_an_outdated_remote_script(monkeypatch):
         },
         {"parameter": "Freq", "point_count": 2},  # what a 1.8.1 Remote Script returns
     ]
-    connection = SimpleNamespace(send_command=lambda c, p: sent.append((c, p)) or replies.pop(0))
+
+    def send(command, params=None):
+        sent.append((command, params))
+        return {"automation_api_version": 2} if command == "get_session_info" else replies.pop(0)
+
+    connection = SimpleNamespace(send_command=send)
     monkeypatch.setattr(arrangement, "get_ableton_connection", lambda: connection)
     points = [{"time": 0, "value": 0.2}, {"time": 4, "value": 0.9}]
     message = arrangement.write_automation(None, 0, 0, 0, "Freq", points, "ramp")
     assert "17 steps" in message and "set Freq to 40.0" in message
-    assert sent[0][1]["mode"] == "ramp" and sent[0][1]["step_length"] == 0.0625
+    assert sent[0] == ("get_session_info", None)
+    assert sent[1][1]["mode"] == "ramp" and sent[1][1]["step_length"] == 0.0625
     assert "older than this server" in arrangement.write_automation(None, 0, 0, 0, "Freq", points)
 
     tool = next(t for t in asyncio.run(mcp.list_tools()) if t.name == "write_automation")
@@ -336,7 +344,14 @@ def _tool(monkeypatch, replies):
     from ableton_live_mcp.tools import arrangement
 
     sent, slept = [], []
-    connection = SimpleNamespace(send_command=lambda c, p: sent.append((c, p)) or replies.pop(0))
+
+    def send(command, params=None):
+        if command == "get_session_info":
+            return {"automation_api_version": 2}
+        sent.append((command, params))
+        return replies.pop(0)
+
+    connection = SimpleNamespace(send_command=send)
     monkeypatch.setattr(arrangement, "get_ableton_connection", lambda: connection)
     monkeypatch.setattr(arrangement.time, "sleep", slept.append)
     return arrangement.write_automation, sent, slept

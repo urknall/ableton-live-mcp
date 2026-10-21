@@ -17,7 +17,14 @@ METHOD = next(
     n for n in CLASS.body if isinstance(n, ast.FunctionDef) and n.name == "_read_automation"
 )
 NAMESPACE = {"math": math}
-exec(compile(ast.Module(body=[METHOD], type_ignores=[]), str(SCRIPT_PATH), "exec"), NAMESPACE)
+FINITE = next(
+    n
+    for n in ast.parse(SCRIPT_PATH.read_text()).body
+    if isinstance(n, ast.FunctionDef) and n.name == "_finite_number"
+)
+exec(
+    compile(ast.Module(body=[FINITE, METHOD], type_ignores=[]), str(SCRIPT_PATH), "exec"), NAMESPACE
+)
 read_automation = NAMESPACE["_read_automation"]
 
 

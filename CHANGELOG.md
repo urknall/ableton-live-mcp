@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Clip automation: integrate duration/ramp writing (#4) and sampled read-back (#5).
+  Omitted point durations now hold until the next point or clip end; explicit
+  zero durations and empty/no-op writes fail before clearing existing envelopes.
+  Beat-zero settling also covers point holds. Ramps remain staircase approximations.
+- Automation reads reject non-finite/negative times and include the requested end
+  in grids. Both write modes and all read paths have bounded sizes.
+- Automation writes, including nested batches, check the running Remote Script's
+  automation capability before any mutation. Install the matching Remote Script
+  and restart Live; replacing the Python server alone is insufficient.
+
 ## 1.8.1 — 2026-09-16
 
 - Live 11: the Remote Script no longer logs `Server accept error: timed out` every

@@ -28,6 +28,7 @@ DEFAULT_PORT = int(os.environ.get("ABLETON_MCP_PORT", "9877"))
 HOST = os.environ.get("ABLETON_MCP_HOST", "127.0.0.1")
 MAX_REQUEST_BYTES = 10 * 1024 * 1024  # backstop against a poisoned request buffer
 BRIDGE_VERSION = "1.8.1"
+AUTOMATION_API_VERSION = 2  # safe point holds, bounded reads, and ramp support
 AUTOMATION_RAMP_STEP = 0.0625  # beats between generated ramp steps (1/16 beat)
 MAX_AUTOMATION_STEPS = 4096  # keeps one write well inside the 10 s main-thread budget
 
@@ -46,8 +47,8 @@ def _automation_steps(points, mode="points", step_length=AUTOMATION_RAMP_STEP,
                       hold_until=None, value_range=None):
     """Expand write_automation points into (time, length, value) insert_step calls.
 
-    mode "points": one step per point, length = the point's "duration" (default
-    0.0, the original behaviour). mode "ramp": consecutive points are joined by
+    mode "points": hold each value for its duration, or to the next point / clip
+    end when omitted. Explicit zero durations are rejected. mode "ramp": points are joined by
     contiguous steps about step_length beats long, each holding the linear value
     at its start, except that the last segment spreads its values so its final
     step already holds the final value (Live 11 drops a 0-length hold at the clip
@@ -58,6 +59,10 @@ def _automation_steps(points, mode="points", step_length=AUTOMATION_RAMP_STEP,
         raise ValueError(f"mode must be 'points' or 'ramp', got {mode!r}")
     if not isinstance(points, (list, tuple)) or not points:
         raise ValueError("points must be a non-empty list of {time, value} objects")
+    if len(points) > MAX_AUTOMATION_STEPS:
+        raise ValueError(f"Too many automation points (limit {MAX_AUTOMATION_STEPS})")
+    if hold_until is not None:
+        hold_until = _finite_number(hold_until, "clip end")
     parsed = []
     for i, pt in enumerate(points):
         if not isinstance(pt, dict) or "time" not in pt or "value" not in pt:
@@ -70,11 +75,32 @@ def _automation_steps(points, mode="points", step_length=AUTOMATION_RAMP_STEP,
             raise ValueError(f"points[{i}].time must be >= 0 beats")
         if d is not None and d < 0:
             raise ValueError(f"points[{i}].duration must be >= 0 beats")
+        if d == 0:
+            raise ValueError(f"points[{i}].duration must be greater than 0 beats; zero-length steps do not hold a value")
+        if d is not None and not math.isfinite(t + d):
+            raise ValueError("Automation hold end must be finite")
         if value_range is not None and not value_range[0] <= v <= value_range[1]:
             raise ValueError(f"points[{i}].value {v} is outside the parameter range {value_range[0]} to {value_range[1]}")
         parsed.append((t, v, d))
     if mode == "points":
-        return [(t, 0.0 if d is None else d, v) for t, v, d in parsed]
+        steps = []
+        for i, (t, v, d) in enumerate(parsed):
+            next_time = parsed[i + 1][0] if i + 1 < len(parsed) else hold_until
+            if i and t <= parsed[i - 1][0]:
+                raise ValueError("points must be in strictly increasing time order")
+            if d is None:
+                if next_time is None or next_time < t:
+                    raise ValueError("Cannot infer a hold: supply duration or a clip end after the point")
+                d = next_time - t
+                # An endpoint at the clip end is a boundary, not a playable hold.
+                if d == 0 and i == len(parsed) - 1:
+                    continue
+            if d <= 0 or not math.isfinite(t + d):
+                raise ValueError("Automation holds must have a finite, positive duration")
+            steps.append((t, d, v))
+        if not steps:
+            raise ValueError("No playable automation: supply a duration or a point before the clip end")
+        return steps
 
     step_length = _finite_number(step_length, "step_length")
     if step_length <= 0:
@@ -91,7 +117,10 @@ def _automation_steps(points, mode="points", step_length=AUTOMATION_RAMP_STEP,
     for (t0, v0, _), (t1, v1, _) in zip(parsed, parsed[1:]):
         span = t1 - t0
         if span > 0:  # same time twice = an instant jump to the next segment's value
-            segments.append([t0, v0, t1, v1, max(1, int(math.ceil(span / step_length - 1e-9)))])
+            count = span / step_length
+            if not math.isfinite(count) or count > MAX_AUTOMATION_STEPS:
+                raise ValueError(f"Ramp exceeds limit {MAX_AUTOMATION_STEPS}; use a larger step_length")
+            segments.append([t0, v0, t1, v1, max(1, int(math.ceil(count - 1e-9)))])
     if segments:
         segments[-1][4] = max(2, segments[-1][4])  # room for both of its end values
     total = sum(seg[4] for seg in segments) + 1
@@ -108,6 +137,8 @@ def _automation_steps(points, mode="points", step_length=AUTOMATION_RAMP_STEP,
     if d_last is None:
         d_last = max(0.0, hold_until - t_last) if hold_until is not None else 0.0
     steps.append((t_last, d_last, v_last))
+    if not any(length > 0 for _, length, _ in steps):
+        raise ValueError("No playable automation: supply a duration or a ramp with positive length")
     return steps
 
 
@@ -666,6 +697,7 @@ class AbletonMCP(ControlSurface):
                 "clip_trigger_quantization": self._safe_song_property("clip_trigger_quantization", int, 4),
                 "live_version": self._live_version(),
                 "bridge_version": BRIDGE_VERSION,
+                "automation_api_version": AUTOMATION_API_VERSION,
             }
             return result
         except Exception as e:
@@ -1496,16 +1528,13 @@ class AbletonMCP(ControlSurface):
         except Exception:
             pass
         # Clear any existing automation for this param first (clip-level method).
-        try:
-            clip.clear_envelope(param)
-        except Exception:
-            pass
+        clip.clear_envelope(param)
         # A new envelope starts from the parameter's current value, and Live 11
         # keeps that value at the exact clip start, so a ramp from beat 0 jumps
         # through it on every loop (an audible click). Setting the parameter to
-        # the ramp's first value first removes the jump. Points mode is left alone.
+        # the first value first removes the jump for both ramps and point holds.
         start_value_set = None
-        if mode == "ramp" and steps[0][0] == 0.0:
+        if steps[0][0] == 0.0:
             try:
                 param.value = steps[0][2]
                 start_value_set = float(param.value)
@@ -1527,7 +1556,7 @@ class AbletonMCP(ControlSurface):
         # created above may still start from the old value. Report whether beat 0
         # reads the ramp's first value; the MCP tool rewrites the ramp if not.
         start_settled = None
-        if start_value_set is not None:
+        if steps[0][0] == 0.0:
             try:
                 tolerance = 1e-5 * max(1.0, abs(float(param.max) - float(param.min)))
                 start_settled = abs(float(env.value_at_time(0.0)) - steps[0][2]) <= tolerance
@@ -1557,20 +1586,28 @@ class AbletonMCP(ControlSurface):
                     ends.append(float(getattr(clip, attr)))
                 except Exception:
                     pass
-            first = float(start) if start is not None else 0.0
-            last = float(end) if end is not None else (max(ends) if ends else first)
-            spacing = float(step) if step is not None else 1.0
-            if not spacing > 0 or not last >= first:
-                raise ValueError("Need step > 0 and end >= start")
-            count = int(math.floor((last - first) / spacing + 1e-9)) + 1
-            if count > self.MAX_AUTOMATION_SAMPLES:
-                raise ValueError(f"{count} samples requested (limit {self.MAX_AUTOMATION_SAMPLES}); "
-                                 "use a larger step or a shorter range")
+            first = _finite_number(start, "start") if start is not None else 0.0
+            last = _finite_number(end if end is not None else (max(ends) if ends else first), "end")
+            spacing = _finite_number(step, "step") if step is not None else 1.0
+            if first < 0 or not spacing > 0 or not last >= first:
+                raise ValueError("Need start >= 0, step > 0 and end >= start")
+            intervals = (last - first) / spacing
+            if not math.isfinite(intervals) or intervals >= self.MAX_AUTOMATION_SAMPLES:
+                raise ValueError(f"Too many samples (limit {self.MAX_AUTOMATION_SAMPLES}); use a larger step or a shorter range")
+            count = int(math.floor(intervals)) + 1
             times = [first + i * spacing for i in range(count)]
+            if times[-1] < last:
+                times.append(last)
+            if len(times) > self.MAX_AUTOMATION_SAMPLES:
+                raise ValueError(f"Too many samples including endpoint (limit {self.MAX_AUTOMATION_SAMPLES})")
         else:
-            times = [float(t) for t in times]
+            if not isinstance(times, (list, tuple)) or not times:
+                raise ValueError("times must be a non-empty list")
             if len(times) > self.MAX_AUTOMATION_SAMPLES:
                 raise ValueError(f"At most {self.MAX_AUTOMATION_SAMPLES} times per call")
+            times = [_finite_number(t, "sample time") for t in times]
+            if any(t < 0 for t in times):
+                raise ValueError("sample times must be >= 0")
         result = {"parameter": param.name, "device": device.name,
                   "min": param.min, "max": param.max, "current_value": param.value}
         env = clip.automation_envelope(param)

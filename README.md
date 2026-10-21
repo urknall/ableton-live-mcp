@@ -144,6 +144,29 @@ identifiers from the running bridge. Call it before and after an edit; the first
 call establishes the comparison baseline. Installing an updated Remote Script and
 restarting Live keeps the bridge's snapshot format matched to the server.
 
+## Clip automation
+
+`write_automation` replaces one device parameter's Session-clip envelope.
+Times and durations are beats; values use the parameter's native min/max range.
+The default `mode="points"` holds each value until the next point, with the last
+value held to the clip end. An explicit positive `duration` overrides a hold.
+Zero durations are rejected, and a final point at the clip end is a boundary only.
+Use `mode="ramp"` for a fade or sweep: it approximates linear ramps with contiguous
+steps (default resolution 0.0625 beats), rather than native continuous curves.
+Both modes are limited to 4096 steps and validate before clearing the envelope.
+
+`read_automation` samples that envelope at explicit `times` or a `start/end/step`
+grid, including the end (1024 samples maximum). Sample just after a breakpoint
+to avoid Live 11's boundary behavior, for example `[0.01, 4.01, 8.01]`.
+Read-back checks Session envelopes; verify Arrangement playback and save/reload
+separately. Values are not an auditory quality check.
+
+Writes at beat zero also set the parameter's initial value and retry briefly if
+Live has not applied it yet. Inspect `start_settled` when using `batch_commands`;
+batches cannot pause for these retries. A missing/old automation capability is
+rejected before writing: update the server **and** installed Remote Script,
+restart Live, and reconnect the MCP client.
+
 ## Focusing the toolset
 
 The server registers 157 tools. That is a lot for a model to choose from on a small

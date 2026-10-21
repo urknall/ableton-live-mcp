@@ -121,8 +121,8 @@ AutomationMode = Annotated[
     Literal["points", "ramp"],
     Field(
         description=(
-            '"points" writes each point as a step of its duration (default 0, a spike); '
-            '"ramp" joins consecutive points with linear ramps.'
+            '"points" holds to the next point / clip end unless duration is given; '
+            '"ramp" approximates linear ramps with short contiguous steps.'
         )
     ),
 ]
@@ -136,7 +136,19 @@ RampStepLength = Annotated[
 ]
 
 
-@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
+def _require_automation_bridge(connection):
+    """Reject an old writer before it can clear an envelope and write spikes."""
+    info = connection.send_command("get_session_info")
+    version = info.get("automation_api_version", 0)
+    if not isinstance(version, int) or version < 2:
+        raise RuntimeError(
+            "The running Remote Script lacks safe automation support. "
+            "Install the matching Remote Script and restart Live before writing automation. "
+            "No automation was changed."
+        )
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 def write_automation(
     ctx: Context,
     track_index: TrackIndex,
@@ -154,15 +166,17 @@ def write_automation(
     read min and max with get_device_parameters first. Out-of-range values, bad times
     and over-long ramps are rejected before anything is written.
 
-    mode="points" (default): each point becomes a step lasting its "duration" beats.
-    Without a duration the step has zero length, which plays as a momentary spike,
-    so give a duration to hold a value.
+    mode="points" (default): hold each value until the next point, and the last
+    value until the clip end. An explicit positive "duration" overrides that hold.
+    Times must strictly increase. A final point exactly at the clip end is only
+    a boundary. Zero durations and requests with no playable hold are rejected.
 
     mode="ramp": consecutive points are joined by a linear ramp, written as contiguous
     steps of about step_length beats, and the final value is reached by the ramp's
     end. Points must be in time order; two points at the same time make an instant
     jump. The last point holds until the clip end unless it has a duration; only the
-    last point may have one. A ramp that starts at beat 0 also sets the parameter
+    last point may have one. This is a staircase approximation, not a native
+    continuous curve. Any write that starts at beat 0 also sets the parameter
     itself to the first value, so the clip does not jump from the old value at its
     start on every loop. Live applies that value on its next update, so the tool
     rewrites the ramp (up to three times, pausing briefly) until beat 0 reads the
@@ -173,6 +187,7 @@ def write_automation(
       points=[{"time": 0, "value": 0.2}, {"time": 16, "value": 0.9}], mode="ramp"
     """
     connection = get_ableton_connection()
+    _require_automation_bridge(connection)
     params = {
         "track_index": track_index,
         "clip_index": clip_index,
@@ -211,6 +226,8 @@ def write_automation(
         )
     elif rewrites:
         message += f" (rewrote the ramp {rewrites}x while Live applied the new value)"
+    if r.get("start") == 0 and r.get("start_settled") is None:
+        message += ". Warning: the starting value could not be verified; read the envelope back."
     return message
 
 
@@ -251,6 +268,7 @@ def read_automation(
     times: Annotated[
         list[float] | None,
         Field(
+            min_length=1,
             max_length=1024,
             description="Explicit beat positions from the clip start to sample. Overrides start/end/step.",
         ),
@@ -269,7 +287,8 @@ def read_automation(
     envelope at beat positions, to verify what write_automation produced.
 
     Pass explicit times, or a start/end/step grid (default: every beat from the clip
-    start to the clip end; at most 1024 samples). Values are native parameter values
+    start to the clip end, including the end; at most 1024 samples). All times
+    must be finite and nonnegative. Values are native parameter values
     with a display string where Live provides one. has_envelope is false when the
     clip has no automation for that parameter. Read-only.
 

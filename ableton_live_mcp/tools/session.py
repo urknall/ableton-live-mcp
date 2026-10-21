@@ -190,7 +190,22 @@ def batch_commands(ctx: Context, commands: list[dict]) -> str:
     server-side. Prefer this for multi-step edits: fewer round-trips, one undo
     reverts all.
     """
-    result = get_ableton_connection().send_command("batch", {"commands": commands})
+    connection = get_ableton_connection()
+    pending = list(commands)
+    while pending:
+        command = pending.pop()
+        if not isinstance(command, dict):
+            continue
+        if command.get("type") == "write_automation":
+            from .arrangement import _require_automation_bridge
+
+            _require_automation_bridge(connection)
+            break
+        if command.get("type") in ("batch", "batch_commands"):
+            nested = command.get("params", {})
+            if isinstance(nested, dict) and isinstance(nested.get("commands"), list):
+                pending.extend(nested["commands"])
+    result = connection.send_command("batch", {"commands": commands})
     return json.dumps(result, indent=2)
 
 
