@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from dataclasses import dataclass
 from typing import Any, Callable, TextIO
@@ -136,3 +137,5 @@ def _validate_type(value: Any, expected: str, path: str) -> None:
     check = checks.get(expected)
     if check and not check(value):
         raise ValueError("%s must be %s" % (path, expected))
+    if expected == "number" and not math.isfinite(float(value)):
+        raise ValueError("%s must be finite; NaN and Infinity are not allowed" % path)

@@ -142,7 +142,9 @@ def make_server(client: AbletonBridgeClient | None = None) -> StdioMcpServer:
     guarded_response_controls = dict(response_controls)
     guarded_response_controls["expected_set_signature"] = {"type": "string"}
     strict_timeout_control = {"strict_timeout": {"type": "boolean"}}
-    server.add_tool(Tool("live_get", "Resolve object; read selected properties/children.", schema({
+    # device_origin is synthetic, bridge-owned observation, never caller authority
+    # or a LOM property. Lifecycle/structural uncertainty makes it unresolved.
+    server.add_tool(Tool("live_get", "Read properties/children.", schema({
         "ref": ref,
         "properties": {"type": "array", "items": {"type": "string"}},
         "children": {"oneOf": [
@@ -162,7 +164,7 @@ def make_server(client: AbletonBridgeClient | None = None) -> StdioMcpServer:
         "include_master_track": {"type": "boolean"},
         **response_controls,
     }), forward("set_summary")))
-    server.add_tool(Tool("live_set", "Set a writable Live object property.", schema({
+    server.add_tool(Tool("live_set", "Set a writable property.", schema({
         "ref": ref,
         "property": {"type": "string"},
         "value": {},
@@ -181,16 +183,19 @@ def make_server(client: AbletonBridgeClient | None = None) -> StdioMcpServer:
         "limit": {"type": "integer", "minimum": 0},
         **response_controls,
     }, ["ref", "child"]), forward("children")))
-    server.add_tool(Tool("live_device_parameters", "Compact Device parameter metadata.", schema({
+    server.add_tool(Tool("live_device_parameters", "List Live-exposed parameters.", schema({
         "ref": ref,
         "query": {"type": "string"},
         "limit": {"type": "integer", "minimum": 0},
+        "offset": {"type": "integer", "minimum": 0},
         **response_controls,
     }, ["ref"]), forward("device_parameters")))
-    server.add_tool(Tool("live_parameter_set", "Set DeviceParameter value.", schema({
+    server.add_tool(Tool("live_parameter_set", "Set a parameter with readback.", schema({
         "ref": ref,
         "value": {"type": "number"},
+        "domain": {"type": "string", "enum": ["raw", "display"]},
         "coerce": {"type": "boolean"},
+        "allow_inactive": {"type": "boolean"},
         **mutation_controls,
     }, ["ref", "value"]), forward("parameter_set")))
     server.add_tool(Tool("live_clip_notes", "List MIDI notes from a clip compactly.", schema({
@@ -492,7 +497,9 @@ def make_server(client: AbletonBridgeClient | None = None) -> StdioMcpServer:
         "stop_score": {"type": "integer"},
         "match_all_terms": {"type": "boolean"},
     }), forward("browser_search")))
-    server.add_tool(Tool("live_browser_load", "Load BrowserItem.", schema({
+    # Origin attribution is independent of optional plug-in metadata and is
+    # reconciled by native identity across normal/return/main/chain movement.
+    server.add_tool(Tool("live_browser_load", "Load a BrowserItem.", schema({
         "item": browser_item_ref,
         "target_track": ref,
         **mutation_controls,

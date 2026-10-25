@@ -2,12 +2,15 @@ from __future__ import absolute_import, print_function
 
 import json
 import hashlib
+import math
 import os
 import socket
 import sys
 import threading
 import time
 import traceback
+import uuid
+import urllib.parse
 
 import Live
 from _Framework.ControlSurface import ControlSurface
@@ -121,11 +124,16 @@ class AbletonLiveMCP(ControlSurface):
         self._main_thread_busy_since = 0.0
         self._main_thread_busy_timed_out = False
         self._handler_slots = threading.BoundedSemaphore(16)
+        self._device_origins = {}
+        self._origin_song_id = None
+        self._origin_reset_reason = None
+        self._runtime_session_id = uuid.uuid4().hex
         with self.component_guard():
             self._start_server()
 
     def disconnect(self):
         self._running = False
+        self._clear_device_origins()
         if self._server:
             try:
                 self._server.close()
@@ -389,7 +397,20 @@ class AbletonLiveMCP(ControlSurface):
     def _rpc_ping(self, _params):
         app = Live.Application.get_application()
         version = app.get_version_string() if hasattr(app, "get_version_string") else "unknown"
-        return {"ok": True, "version": version, "major": self._major_version(version), "remote_script": self._remote_script_info()}
+        return {
+            "ok": True,
+            "version": version,
+            "major": self._major_version(version),
+            "runtime_session_id": self._runtime_session(),
+            "remote_script": self._remote_script_info(),
+        }
+
+    def _runtime_session(self):
+        session_id = getattr(self, "_runtime_session_id", None)
+        if not session_id:
+            session_id = uuid.uuid4().hex
+            self._runtime_session_id = session_id
+        return session_id
 
     def _remote_script_info(self):
         path = globals().get("__file__", "")
@@ -1044,7 +1065,7 @@ class AbletonLiveMCP(ControlSurface):
         obj = self._resolve(params.get("ref"))
         props = {}
         for name in params.get("properties") or []:
-            props[name] = getattr(obj, name)
+            props[name] = self._device_origin(obj) if name == "device_origin" else getattr(obj, name)
         children = {}
         detail = self._detail(params)
         child_specs = params.get("children") or []
@@ -1058,13 +1079,21 @@ class AbletonLiveMCP(ControlSurface):
             if truncated:
                 children[name].append({"truncated": True})
         summary = self._object_summary(obj, detail)
+        if "device_origin" in props:
+            summary["canonical_path"] = self._origin_current_path(obj)
         summary["properties"] = props
         summary["children"] = children
         return summary
 
     def _rpc_set(self, params):
         obj = self._resolve(params.get("ref"))
-        setattr(obj, params["property"], params.get("value"))
+        prop = params["property"]
+        if prop in ("value", "display_value") and self._looks_like_device_parameter(obj):
+            safe = dict(params)
+            safe["ref"] = {"id": self._object_id(obj)}
+            safe["domain"] = "raw" if prop == "value" else "display"
+            return self._rpc_parameter_set(safe)
+        setattr(obj, prop, params.get("value"))
         return self._object_summary(obj, self._detail(params))
 
     def _rpc_call(self, params):
@@ -1085,57 +1114,142 @@ class AbletonLiveMCP(ControlSurface):
         device = self._resolve(params.get("ref"))
         query = (params.get("query") or "").strip().lower()
         terms = [term for term in query.split() if term]
-        limit = params.get("limit")
-        result = []
-        max_matches = DEFAULT_CHILD_LIMIT if limit is None else limit
-        unlimited = max_matches is not None and max_matches < 0
-        truncated = False
-        for param in getattr(device, "parameters"):
+        limit = int(params.get("limit") if params.get("limit") is not None else DEFAULT_CHILD_LIMIT)
+        offset = int(params.get("offset") or 0)
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
+        parameters = list(getattr(device, "parameters"))
+        device_path = self._origin_current_path(device) or self._canonical_path(device)
+        matches = []
+        for index, param in enumerate(parameters):
             name = getattr(param, "name", "")
             if terms and not all(term in name.lower() for term in terms):
                 continue
-            if not unlimited and len(result) >= max_matches:
-                truncated = True
-                break
-            item = self._parameter_summary(param)
-            result.append(item)
-        if truncated:
-            result.append({"truncated": True})
-        return result
+            matches.append((index, param))
+        selected = matches[offset:] if limit < 0 else matches[offset:offset + limit]
+        rows = [self._parameter_summary(param, index=index, device_path=device_path)
+            for index, param in selected]
+        total = len(matches)
+        next_offset = offset + len(rows)
+        truncated = next_offset < total
+        # The RPC owns pagination. Do not let the generic encoder append a second
+        # sentinel object inside the homogeneous parameter array.
+        params["max_items"] = -1
+        device_summary = self._object_summary(device, False)
+        device_summary["path"] = device_path
+        device_summary["ref"] = dict((key, value) for key, value in (
+            ("id", device_summary.get("id")), ("path", device_path)) if value is not None)
+        return {
+            "scope": "live_exposed_automatable_parameters",
+            "device": device_summary,
+            "inventory_total": len(parameters),
+            "matched_total": total,
+            "offset": offset,
+            "limit": limit,
+            "returned": len(rows),
+            "omitted": max(0, total - next_offset),
+            "truncated": truncated,
+            "complete": not truncated,
+            "next_offset": next_offset if truncated else None,
+            "parameters": rows,
+        }
 
     def _rpc_parameter_set(self, params):
         param = self._resolve(params.get("ref"))
-        before = self._parameter_summary(param)
-        if not hasattr(param, "value"):
-            raise AttributeError("Object has no value property")
         value = params.get("value")
         if value is None:
             raise ValueError("value is required")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("value must be a finite number, not bool")
+        if not math.isfinite(float(value)):
+            raise ValueError("value must be finite; NaN and Infinity are not allowed")
+        domain = params.get("domain") or "raw"
+        if domain not in ("raw", "display"):
+            raise ValueError("domain must be raw or display")
+        before = self._parameter_summary(param)
+        if not hasattr(param, "value"):
+            raise AttributeError("Object has no value property")
+        enabled = before.get("is_enabled")
+        if type(enabled) is not bool:
+            raise RuntimeError("parameter is_enabled permission is unavailable or invalid")
+        if not enabled:
+            raise RuntimeError("parameter is disabled; refusing write")
+        state = before.get("state")
+        if isinstance(state, bool) or not isinstance(state, int) or state not in (0, 1, 2):
+            raise RuntimeError("parameter state permission is unavailable or invalid")
+        if state == 2:
+            raise RuntimeError("parameter state is not writable; refusing write")
+        if state == 1 and not params.get("allow_inactive"):
+            raise RuntimeError("parameter is writable but inactive; pass allow_inactive:true to write")
         min_value = before.get("min")
         max_value = before.get("max")
-        if params.get("coerce"):
-            if min_value is not None and value < min_value:
-                value = min_value
-            if max_value is not None and value > max_value:
-                value = max_value
-            if before.get("is_quantized"):
-                value = int(round(value))
+        submitted = value
+        if domain == "display":
+            if params.get("coerce"):
+                raise ValueError("coerce is only supported for the raw domain")
+            if "display_value" not in before:
+                raise RuntimeError("parameter display_value domain is unavailable")
         else:
-            if min_value is not None and value < min_value:
-                raise ValueError("value %s is below parameter min %s" % (value, min_value))
-            if max_value is not None and value > max_value:
-                raise ValueError("value %s is above parameter max %s" % (value, max_value))
-            if before.get("is_quantized") and int(value) != value:
-                raise ValueError("quantized parameter requires an integer value or coerce:true")
-        param.value = value
+            if params.get("coerce"):
+                if min_value is not None and submitted < min_value:
+                    submitted = min_value
+                if max_value is not None and submitted > max_value:
+                    submitted = max_value
+                if before.get("is_quantized"):
+                    submitted = int(round(submitted))
+            else:
+                if min_value is not None and submitted < min_value:
+                    raise ValueError("value %s is below parameter min %s" % (submitted, min_value))
+                if max_value is not None and submitted > max_value:
+                    raise ValueError("value %s is above parameter max %s" % (submitted, max_value))
+                if before.get("is_quantized") and int(submitted) != submitted:
+                    raise ValueError("quantized parameter requires an integer value or coerce:true")
+        if domain == "display":
+            param.display_value = submitted
+        else:
+            param.value = submitted
         after = self._parameter_summary(param)
+        readback = {
+            "raw_value": after.get("value"),
+            "display_value": after.get("display_value"),
+            "display_text": after.get("display"),
+            "is_enabled": after.get("is_enabled"),
+            "state": after.get("state"),
+            "automation_state": after.get("automation_state"),
+        }
+        readback_value = readback["display_value" if domain == "display" else "raw_value"]
+        readback_matches = readback_value == submitted
+        readback_delta = (readback_value - submitted
+            if isinstance(readback_value, (int, float)) and not isinstance(readback_value, bool)
+            else None)
         return {
             "parameter": after,
             "before": before,
+            "requested": {"domain": domain, "value": value},
             "requested_value": params.get("value"),
+            "submitted_value": submitted,
+            "domain": domain,
+            "host_readback": readback,
+            "requested_equals_host_readback": readback_matches,
+            "host_readback_delta": readback_delta,
+            "validation": {
+                "finite": True,
+                "domain": domain,
+                "domain_range_known": domain == "raw",
+                "is_enabled": enabled,
+                "state": state,
+                "in_range": True if domain == "raw" else None,
+                "quantized": bool(before.get("is_quantized")),
+            },
+            "write_dispatched": True,
             "applied_value": after.get("value"),
-            "changed": after.get("value") != before.get("value"),
+            "changed": (after.get("value") != before.get("value") or
+                after.get("display_value") != before.get("display_value")),
         }
+
+    def _looks_like_device_parameter(self, obj):
+        return (hasattr(obj, "value") and hasattr(obj, "min") and hasattr(obj, "max")
+            and hasattr(obj, "is_quantized") and hasattr(obj, "str_for_value"))
 
     def _rpc_clip_notes(self, params):
         clip = self._resolve(params.get("ref"))
@@ -1615,10 +1729,224 @@ class AbletonLiveMCP(ControlSurface):
     def _rpc_browser_load(self, params):
         item = self._resolve_browser_item(params.get("item"))
         target = params.get("target_track")
+        track = self._resolve(target) if target else self.song().view.selected_track
+        self._ensure_origin_song()
+        before = self._origin_snapshot()
         if target:
-            self.song().view.selected_track = self._resolve(target)
+            self.song().view.selected_track = track
         Live.Application.get_application().browser.load_item(item)
-        return self._browser_item_result(None, item, None)
+        after = self._origin_snapshot()
+        result = self._browser_item_result(None, item, None)
+        result["device_origin"] = self._record_device_origin(item, track, before, after)
+        return result
+
+    def _clear_device_origins(self, reason_code=None):
+        self._device_origins = {}
+        self._origin_reset_reason = reason_code
+
+    def _ensure_origin_song(self):
+        current_id = self._object_id(self.song())
+        previous_id = getattr(self, "_origin_song_id", None)
+        if previous_id is not None and previous_id != current_id:
+            self._clear_device_origins("set_reloaded")
+            self._objects = {}
+        self._origin_song_id = current_id
+
+    def _origin_unresolved(self, reason_code, reason=None, **evidence):
+        result = {
+            "status": "unresolved",
+            "reason_code": reason_code,
+            "reason": reason or reason_code.replace("_", " "),
+        }
+        result.update(evidence)
+        return result
+
+    def _plugin_descriptor(self, item):
+        try:
+            uri = item.uri
+        except Exception:
+            uri = ""
+        parts = uri.split(":") if isinstance(uri, str) else []
+        if len(parts) >= 4 and parts[0] == "query" and parts[1].startswith("Plugins#"):
+            plugin_format = parts[1].split("#", 1)[1]
+            vendor = urllib.parse.unquote(parts[2])
+            product = urllib.parse.unquote(parts[3])
+            if plugin_format and vendor and product:
+                return {
+                    "status": "resolved",
+                    "format": plugin_format,
+                    "vendor": vendor,
+                    "product": product,
+                    "evidence_source": "remote_script_browser_uri",
+                }
+        return {
+            "status": "unavailable",
+            "reason_code": "unsupported_browser_uri" if uri else "browser_metadata_unavailable",
+            "evidence_source": "remote_script_browser_uri",
+        }
+
+    def _record_device_origin(self, item, requested_track, before, after):
+        new_ids = [obj_id for obj_id in after["devices"] if obj_id not in before["devices"]]
+        requested_path = before["tracks"].get(self._object_id(requested_track), {}).get("path") if requested_track is not None else None
+        if not new_ids:
+            return self._origin_unresolved("no_new_device", requested_target_path=requested_path)
+        if len(new_ids) != 1:
+            return self._origin_unresolved("multiple_new_devices",
+                new_device_count=len(new_ids), requested_target_path=requested_path)
+        current = after["devices"][new_ids[0]]
+        try:
+            uri = item.uri
+        except Exception:
+            uri = ""
+        descriptor = self._plugin_descriptor(item)
+        record = {
+            "status": "resolved",
+            "origin_id": uuid.uuid4().hex,
+            "runtime_session_id": self._runtime_session(),
+            "browser_uri": uri,
+            "load_origin": {
+                "source": "live_browser",
+                "browser_uri": uri,
+                "browser_item_name": getattr(item, "name", ""),
+                "requested_target_path": requested_path,
+                "actual_target_path": current["track_path"],
+                "target_changed": bool(requested_path and requested_path != current["track_path"]),
+            },
+            "plugin_descriptor": descriptor,
+            "device_id": current["id"],
+            "loaded_path": current["path"],
+            "current_path": current["path"],
+            "device_path": current["path"],
+            "loaded_track_id": current["track_id"],
+            "loaded_track_path": current["track_path"],
+            "current_track_id": current["track_id"],
+            "current_track_path": current["track_path"],
+            "track_id": current["track_id"],
+            "track_path": current["track_path"],
+            "identity_status": "same_native_object",
+        }
+        if descriptor["status"] == "resolved":
+            record.update({
+                "plugin_format": descriptor["format"],
+                "vendor": descriptor["vendor"],
+                "product": descriptor["product"],
+            })
+        self._device_origins[current["id"]] = record
+        self._origin_reset_reason = None
+        self._reconcile_device_origins(after)
+        return dict(record)
+
+    def _device_origin(self, device):
+        self._ensure_origin_song()
+        snapshot = self._origin_snapshot()
+        self._reconcile_device_origins(snapshot)
+        device_id = self._object_id(device)
+        record = getattr(self, "_device_origins", {}).get(device_id)
+        if record is None:
+            reason = getattr(self, "_origin_reset_reason", None) or "no_origin_record"
+            return self._origin_unresolved(reason)
+        if record.get("status") != "resolved":
+            return dict(record)
+        return dict(record)
+
+    def _origin_same_object(self, left, right):
+        if left is right:
+            return True
+        # Live recreates Python wrappers. Only native object identity can prove
+        # continuity across them; equal names/paths never establish identity.
+        left_ptr, right_ptr = getattr(left, "_live_ptr", None), getattr(right, "_live_ptr", None)
+        return left_ptr is not None and left_ptr == right_ptr and bool(left_ptr)
+
+    def _origin_current_path(self, obj):
+        snapshot = self._origin_snapshot()
+        obj_id = self._object_id(obj)
+        if obj_id in snapshot["tracks"]:
+            return snapshot["tracks"][obj_id]["path"]
+        if obj_id in snapshot["devices"]:
+            return snapshot["devices"][obj_id]["path"]
+        return None
+
+    def _origin_snapshot(self):
+        song = self.song()
+        result = {"song_id": self._object_id(song), "tracks": {}, "devices": {}}
+        seen_devices = set()
+
+        def walk_devices(container, container_path, track, track_path):
+            try:
+                devices = list(container.devices)
+            except Exception:
+                return
+            for index, device in enumerate(devices):
+                try:
+                    device_id = self._object_id(device)
+                except Exception:
+                    continue
+                path = "%s devices %s" % (container_path, index)
+                if device_id in seen_devices:
+                    continue
+                seen_devices.add(device_id)
+                result["devices"][device_id] = {
+                    "id": device_id,
+                    "object": device,
+                    "path": path,
+                    "track_id": self._object_id(track),
+                    "track_path": track_path,
+                }
+                for child_name in ("chains", "return_chains"):
+                    try:
+                        chains = list(getattr(device, child_name))
+                    except Exception:
+                        continue
+                    for chain_index, chain in enumerate(chains):
+                        chain_path = "%s %s %s" % (path, child_name, chain_index)
+                        walk_devices(chain, chain_path, track, track_path)
+
+        def add_track(track, path):
+            try:
+                track_id = self._object_id(track)
+            except Exception:
+                return
+            result["tracks"][track_id] = {"id": track_id, "object": track, "path": path}
+            walk_devices(track, path, track, path)
+
+        for index, track in enumerate(getattr(song, "tracks", ())):
+            add_track(track, "live_set tracks %s" % index)
+        for index, track in enumerate(getattr(song, "return_tracks", ())):
+            add_track(track, "live_set return_tracks %s" % index)
+        try:
+            add_track(song.master_track, "live_set master_track")
+        except Exception:
+            pass
+        return result
+
+    def _reconcile_device_origins(self, snapshot=None):
+        snapshot = snapshot or self._origin_snapshot()
+        for device_id, record in list(getattr(self, "_device_origins", {}).items()):
+            current = snapshot["devices"].get(device_id)
+            if current is None:
+                record.update({
+                    "status": "unresolved",
+                    "reason_code": "device_deleted",
+                    "reason": "device deleted or replaced",
+                    "identity_status": "deleted",
+                    "current_path": None,
+                    "current_track_id": None,
+                    "current_track_path": None,
+                    "device_path": None,
+                    "track_id": None,
+                    "track_path": None,
+                })
+                continue
+            record.update({
+                "status": "resolved",
+                "current_path": current["path"],
+                "current_track_id": current["track_id"],
+                "current_track_path": current["track_path"],
+                "device_path": current["path"],
+                "track_id": current["track_id"],
+                "track_path": current["track_path"],
+                "identity_status": "same_native_object",
+            })
 
     def _rpc_load_device(self, params):
         # Convenience over browser_search + browser_load: find a loadable device/preset
@@ -1808,7 +2136,17 @@ class AbletonLiveMCP(ControlSurface):
             obj_id = int(ref["id"])
             if obj_id not in self._objects:
                 raise KeyError("Unknown or stale object id %s; rerun get/search and use the new id" % obj_id)
-            return self._objects[obj_id]
+            obj = self._objects[obj_id]
+            class_name = obj.__class__.__name__
+            if class_name == "Device" or class_name.endswith("PluginDevice") or class_name.startswith("MxDevice"):
+                try:
+                    current = self._origin_snapshot()["devices"]
+                except Exception:
+                    current = {}
+                if obj_id not in current:
+                    del self._objects[obj_id]
+                    raise KeyError("Unknown or stale object id %s; device was deleted, replaced, or the Set was reloaded" % obj_id)
+            return obj
         return self._resolve_path(ref.get("path") or "live_set")
 
     def _resolve_browser_item(self, ref):
@@ -1947,28 +2285,39 @@ class AbletonLiveMCP(ControlSurface):
             pass
         return result
 
-    def _parameter_summary(self, param):
+    def _parameter_summary(self, param, index=None, device_path=None):
         obj_id = self._object_id(param)
         self._remember_object(obj_id, param)
         result = {
             "id": obj_id,
+            "ref": {"id": obj_id},
             "name": getattr(param, "name", ""),
             "value": getattr(param, "value", None),
         }
-        for attr in ("min", "max", "default_value", "display_value", "is_quantized"):
+        if index is not None:
+            result["index"] = index
+            if device_path:
+                path = "%s parameters %s" % (device_path, index)
+                result["path"] = path
+                result["ref"]["path"] = path
+        unavailable = []
+        for attr in ("original_name", "min", "max", "default_value", "display_value",
+                     "is_quantized", "is_enabled", "state", "automation_state"):
             try:
                 result[attr] = getattr(param, attr)
             except Exception:
-                pass
+                unavailable.append(attr)
         try:
             result["display"] = param.str_for_value(param.value)
         except Exception:
-            pass
+            unavailable.append("display")
         try:
             if getattr(param, "is_quantized", False):
                 result["value_items"] = list(param.value_items)
         except Exception:
-            pass
+            unavailable.append("value_items")
+        if unavailable:
+            result["unavailable_fields"] = unavailable
         return result
 
     def _track_summary(self, track, index, clip_slot_limit, device_limit, arrangement_clip_limit=0):

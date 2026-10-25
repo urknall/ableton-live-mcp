@@ -444,7 +444,13 @@ def test_batch_tool_forwards_operations_to_bridge():
 
 
 def test_device_parameters_tool_forwards_to_bridge():
-    bridge = FakeBridge()
+    metadata = {"parameters": [{"id": 91, "value": .2, "is_enabled": True,
+        "state": 1, "automation_state": 2, "is_quantized": False}]}
+    class ParameterBridge(FakeBridge):
+        def request(self, method, params):
+            super().request(method, params)
+            return metadata
+    bridge = ParameterBridge()
     server = make_server(bridge)
     args = {"ref": {"path": "live_set tracks 0 devices 0"}, "query": "threshold", "limit": 5}
     response = server.handle({
@@ -454,7 +460,7 @@ def test_device_parameters_tool_forwards_to_bridge():
         "params": {"name": "live_device_parameters", "arguments": args},
     })
     assert bridge.calls == [("device_parameters", args)]
-    assert response["result"]["structuredContent"]["method"] == "device_parameters"
+    assert response["result"]["structuredContent"] == metadata
 
 
 def test_agent_audio_tap_tool_forwards_to_bridge():
@@ -559,7 +565,7 @@ def test_transport_tool_rejects_unknown_action_before_bridge():
 def test_parameter_set_tool_forwards_to_bridge():
     bridge = FakeBridge()
     server = make_server(bridge)
-    args = {"ref": {"id": 99}, "value": 0.75, "coerce": True}
+    args = {"ref": {"id": 99}, "value": 0.75, "domain": "raw", "coerce": True}
     response = server.handle({
         "jsonrpc": "2.0",
         "id": 36,
@@ -568,6 +574,20 @@ def test_parameter_set_tool_forwards_to_bridge():
     })
     assert bridge.calls == [("parameter_set", args)]
     assert response["result"]["structuredContent"]["method"] == "parameter_set"
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_parameter_set_tool_rejects_nonfinite_numbers_before_bridge(value):
+    bridge = FakeBridge()
+    server = make_server(bridge)
+    response = server.handle({
+        "jsonrpc": "2.0",
+        "id": 361,
+        "method": "tools/call",
+        "params": {"name": "live_parameter_set", "arguments": {"ref": {"id": 99}, "value": value}},
+    })
+    assert "must be finite" in response["error"]["message"]
+    assert bridge.calls == []
 
 
 def test_clip_note_tools_forward_to_bridge():
