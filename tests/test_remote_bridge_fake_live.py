@@ -146,11 +146,49 @@ class FakeParameter:
 class FakeDevice:
     def __init__(self):
         self.name = "Compressor"
+        self.class_name = "Compressor"
+        self.class_display_name = "Compressor"
+        self.type = 2
+        self.is_active = True
+        self.latency_in_samples = 0
+        self.latency_in_ms = 0.0
+        self.can_have_chains = False
+        self.can_have_drum_pads = False
+        self.can_compare_ab = False
         self.parameters = FakeVector([
             FakeParameter("Device On", 1.0, quantized=True, items=["Off", "On"]),
             FakeParameter("Threshold", 0.85),
             FakeParameter("Ratio", 0.75),
         ])
+
+
+class FakeStringVector:
+    def __init__(self, values):
+        self._values = list(values)
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def __getitem__(self, index):
+        return self._values[index]
+
+
+class FakePluginDevice(FakeDevice):
+    def __init__(self):
+        super().__init__()
+        self.name = "Example Plug-in"
+        self.class_name = "PluginDevice"
+        self.class_display_name = "Example Plug-in"
+        self.type = 1
+        self.is_active = True
+        self.latency_in_samples = 128
+        self.latency_in_ms = 2.666
+        self.is_editor_open = False
+        self.presets = FakeStringVector(["Init", "Bass", "Lead"])
+        self.selected_preset_index = 1
 
 
 class FakeMixerDevice:
@@ -1865,6 +1903,7 @@ def test_device_parameters_are_compact_and_addressable(monkeypatch):
     result = bridge._rpc_device_parameters({"ref": {"path": "live_set tracks 0 devices 0"}, "query": "threshold"})
     assert result["scope"] == "live_exposed_automatable_parameters"
     assert result["inventory_total"] == 3
+    assert result["total"] == 1
     assert result["matched_total"] == 1
     assert result["returned"] == 1
     assert result["complete"] is True
@@ -1894,7 +1933,7 @@ def test_parameter_set_validates_and_coerces_values(monkeypatch):
     threshold = song.tracks[0].devices[0].parameters[1]
     threshold_ref = {"id": bridge._parameter_summary(threshold)["id"]}
 
-    changed = bridge._rpc_parameter_set({"ref": threshold_ref, "value": 0.25})
+    changed = bridge._rpc_parameter_set({"ref": threshold_ref, "domain": "raw", "value": 0.25})
     assert changed["before"]["value"] == 0.85
     assert changed["parameter"]["value"] == 0.25
     assert changed["applied_value"] == 0.25
@@ -1909,25 +1948,36 @@ def test_parameter_set_validates_and_coerces_values(monkeypatch):
     assert changed["write_dispatched"] is True
 
     try:
-        bridge._rpc_parameter_set({"ref": threshold_ref, "value": 2.0})
+        bridge._rpc_parameter_set({"ref": threshold_ref, "domain": "raw", "value": 2.0})
     except ValueError as exc:
         assert "above parameter max" in str(exc)
     else:
         raise AssertionError("expected max validation error")
 
-    coerced = bridge._rpc_parameter_set({"ref": threshold_ref, "value": 2.0, "coerce": True})
+    coerced = bridge._rpc_parameter_set({"ref": threshold_ref, "domain": "raw", "value": 2.0, "coerce": True})
     assert coerced["parameter"]["value"] == 1.0
     assert coerced["changed"] is True
 
     device_on = song.tracks[0].devices[0].parameters[0]
     device_on_ref = {"id": bridge._parameter_summary(device_on)["id"]}
     try:
-        bridge._rpc_parameter_set({"ref": device_on_ref, "value": 0.6})
+        bridge._rpc_parameter_set({"ref": device_on_ref, "domain": "raw", "value": 0.6})
     except ValueError as exc:
         assert "quantized parameter" in str(exc)
     else:
         raise AssertionError("expected quantized validation error")
-    assert bridge._rpc_parameter_set({"ref": device_on_ref, "value": 0.6, "coerce": True})["parameter"]["value"] == 1
+    assert bridge._rpc_parameter_set({"ref": device_on_ref, "domain": "raw", "value": 0.6, "coerce": True})["parameter"]["value"] == 1
+
+
+def test_parameter_set_requires_explicit_value_domain(monkeypatch):
+    bridge, song, _app = make_bridge(monkeypatch)
+    parameter = song.tracks[0].devices[0].parameters[1]
+    ref = {"id": bridge._parameter_summary(parameter)["id"]}
+
+    with pytest.raises(ValueError, match="domain is required"):
+        bridge._rpc_parameter_set({"ref": ref, "value": 0.25})
+
+    assert parameter.value == 0.85
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True])
@@ -1936,7 +1986,7 @@ def test_parameter_set_rejects_nonfinite_and_boolean_values(monkeypatch, value):
     parameter = song.tracks[0].devices[0].parameters[1]
     ref = {"id": bridge._parameter_summary(parameter)["id"]}
     with pytest.raises((TypeError, ValueError), match="finite"):
-        bridge._rpc_parameter_set({"ref": ref, "value": value})
+        bridge._rpc_parameter_set({"ref": ref, "domain": "raw", "value": value})
     assert parameter.value == 0.85
 
 
@@ -1952,7 +2002,7 @@ def test_parameter_set_enforces_current_permission(monkeypatch, enabled, state, 
     parameter.state = state
     ref = {"id": bridge._parameter_summary(parameter)["id"]}
     with pytest.raises(RuntimeError, match=error):
-        bridge._rpc_parameter_set({"ref": ref, "value": 0.25, "allow_inactive": allow_inactive})
+        bridge._rpc_parameter_set({"ref": ref, "domain": "raw", "value": 0.25, "allow_inactive": allow_inactive})
     assert parameter.value == 0.85
 
 
@@ -1961,7 +2011,7 @@ def test_parameter_set_requires_explicit_opt_in_for_inactive_parameter(monkeypat
     parameter = song.tracks[0].devices[0].parameters[1]
     parameter.state = 1
     ref = {"id": bridge._parameter_summary(parameter)["id"]}
-    result = bridge._rpc_parameter_set({"ref": ref, "value": 0.25, "allow_inactive": True})
+    result = bridge._rpc_parameter_set({"ref": ref, "domain": "raw", "value": 0.25, "allow_inactive": True})
     assert result["validation"]["state"] == 1
     assert result["host_readback"]["raw_value"] == 0.25
 
@@ -1991,6 +2041,57 @@ def test_app_browser_path_roots_and_stale_id_errors(monkeypatch):
         assert "Unknown or stale object id" in str(exc)
     else:
         raise AssertionError("expected stale id error")
+
+
+def test_dispatch_returns_structured_live_proxy_errors(monkeypatch):
+    bridge, _song, _app = make_bridge(monkeypatch)
+
+    response = bridge._dispatch({
+        "jsonrpc": "2.0", "id": 9, "method": "get",
+        "params": {"ref": {"id": 123456}, "properties": ["name"]},
+    })
+
+    assert response["error"]["data"] == {
+        "reason_code": "unknown_object_id",
+        "error_type": "_RpcError",
+        "object_id": 123456,
+    }
+
+
+def test_plugin_device_summary_covers_official_lom_metadata(monkeypatch):
+    bridge, _song, _app = make_bridge(monkeypatch)
+    device = FakePluginDevice()
+
+    summary = bridge._device_summary(device)
+
+    assert summary["class_name"] == "PluginDevice"
+    assert summary["class_display_name"] == "Example Plug-in"
+    assert summary["type"] == 1
+    assert summary["type_name"] == "instrument"
+    assert summary["is_active"] is True
+    assert summary["latency_in_samples"] == 128
+    assert summary["latency_in_ms"] == 2.666
+    assert summary["is_editor_open"] is False
+    assert summary["presets"] == ["Init", "Bass", "Lead"]
+    assert summary["selected_preset_index"] == 1
+    assert summary["capabilities"] == {
+        "device_type": "instrument",
+        "has_parameters": True,
+        "has_chains": False,
+        "has_drum_pads": False,
+        "compare_ab": False,
+        "plugin_presets": True,
+        "plugin_editor": True,
+        "selected_plugin_preset": True,
+        "latency": True,
+    }
+    assert summary["plugin_descriptor"]["reason_code"] == "no_browser_origin_metadata"
+
+
+def test_string_vector_encodes_as_json_array(monkeypatch):
+    bridge, _song, _app = make_bridge(monkeypatch)
+
+    assert bridge._encode(FakeStringVector(["A", "B"])) == ["A", "B"]
 
 
 def test_batch_and_id_resolution(monkeypatch):
@@ -2400,6 +2501,14 @@ def test_device_origins_survive_second_load_reorder_move_and_metadata_drift(monk
     assert current["current_path"] == "live_set tracks 1 devices 0"
     assert current["loaded_track_id"] == 124
     assert current["current_track_id"] == 126
+    assert current["drift"]["name"] == {
+        "changed": True,
+        "loaded": "Example",
+        "current": "Renamed by user",
+    }
+    assert current["drift"]["parameter_inventory"]["changed"] is True
+    assert current["loaded_observation"]["parameter_inventory"]["count"] == 3
+    assert current["current_observation"]["parameter_inventory"]["count"] == 3
 
 
 def test_device_origin_delete_create_does_not_inherit_path(monkeypatch):
@@ -2493,6 +2602,63 @@ def test_device_origin_finds_actual_new_track_and_keeps_descriptor_optional(monk
     assert origin["load_origin"]["actual_target_path"] == "live_set tracks 2"
 
 
+@pytest.mark.parametrize("uri,is_device,expected_kind,expected_format", [
+    ("query:Plugins#AUv2:Vendor:Example", True, "plugin", "AUv2"),
+    ("query:Plugins#VST2:Vendor:Example", True, "plugin", "VST2"),
+    ("query:AudioFx#Delay", True, "device", None),
+    ("query:UserLibrary#Preset:Example", False, "preset_or_content", None),
+])
+def test_device_origin_is_not_limited_to_vst3(monkeypatch, uri, is_device, expected_kind, expected_format):
+    bridge, song, app = make_bridge(monkeypatch)
+    item = FakeBrowserItem("Example", loadable=True, device=is_device)
+    item.uri = uri
+
+    def load(_item):
+        device = FakePluginDevice() if expected_format else FakeDevice()
+        song.tracks[1].devices.append(device)
+
+    app.browser.load_item = load
+    bridge._object_summary(item, False)
+    origin = bridge._rpc_browser_load({
+        "item": {"id": bridge._object_id(item)},
+        "target_track": {"path": "live_set tracks 1"},
+    })["device_origin"]
+
+    assert origin["status"] == "resolved"
+    assert origin["origin_kind"] == expected_kind
+    assert origin["load_event"]["browser_uri"] == uri
+    if expected_format:
+        assert origin["plugin_descriptor"]["format"] == expected_format
+    else:
+        assert origin["plugin_descriptor"]["status"] == "unavailable"
+
+
+def test_device_origin_records_nested_chain_path(monkeypatch):
+    bridge, song, app = make_bridge(monkeypatch)
+    rack = FakeDevice()
+    rack.name = "Rack"
+    rack.can_have_chains = True
+    rack.chains = FakeVector([types.SimpleNamespace(devices=FakeVector([]))])
+    rack.return_chains = FakeVector([])
+    song.tracks[1].devices.append(rack)
+    item = FakeBrowserItem("Nested Effect", loadable=True, device=True)
+    item.uri = "query:AudioFx#Nested%20Effect"
+
+    def load(_item):
+        rack.chains[0].devices.append(FakeDevice())
+
+    app.browser.load_item = load
+    bridge._object_summary(item, False)
+    origin = bridge._rpc_browser_load({
+        "item": {"id": bridge._object_id(item)},
+        "target_track": {"path": "live_set tracks 1"},
+    })["device_origin"]
+
+    assert origin["status"] == "resolved"
+    assert origin["loaded_path"] == "live_set tracks 1 devices 0 chains 0 devices 0"
+    assert origin["current_path"] == origin["loaded_path"]
+
+
 def test_device_origin_absent_for_preexisting_and_ambiguous_load(monkeypatch):
     bridge, song, app = make_bridge(monkeypatch)
     result = bridge._rpc_get({"ref": {"path": "live_set tracks 0 devices 0"}, "properties": ["device_origin"]})
@@ -2501,6 +2667,8 @@ def test_device_origin_absent_for_preexisting_and_ambiguous_load(monkeypatch):
     bridge._object_summary(item, False)
     result = bridge._rpc_browser_load({"item": {"id": bridge._object_id(item)}, "target_track": {"path": "live_set tracks 0"}})
     assert result["device_origin"]["reason_code"] == "no_new_device"
+    assert result["device_origin"]["load_event"]["event_id"]
+    assert result["device_origin"]["plugin_descriptor"]["status"] == "unavailable"
 
 
 def test_browser_load_can_reresolve_stale_id_by_uri_or_path(monkeypatch):

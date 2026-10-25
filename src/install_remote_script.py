@@ -123,6 +123,7 @@ def _runtime_code_fingerprint(path: Path) -> str:
         "constants": _source_constant_signatures(tree),
         "functions": _source_function_signatures(compiled, _top_level_function_names(tree)),
         "methods": _source_method_signatures(compiled, tree, "AbletonLiveMCP"),
+        "rpc_error_methods": _source_method_signatures(compiled, tree, "_RpcError"),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 

@@ -16,7 +16,9 @@ NO_MAIN_THREAD_METHODS = {"bridge_status"}
 
 
 class AbletonBridgeError(RuntimeError):
-    pass
+    def __init__(self, message: str, data: Any = None) -> None:
+        super().__init__(message)
+        self.data = data
 
 
 class _BridgeReadTimeout(OSError):
@@ -104,7 +106,7 @@ class AbletonBridgeClient:
             error_message = f"{err.get('code', -32000)} {err.get('message', 'Bridge error')}{suffix}"
             if self._is_main_thread_timeout_error(error_message):
                 self._mark_client_stall(method, params)
-            raise AbletonBridgeError(error_message)
+            raise AbletonBridgeError(error_message, data=err.get("data"))
         return message.get("result")
 
     def close(self) -> None:

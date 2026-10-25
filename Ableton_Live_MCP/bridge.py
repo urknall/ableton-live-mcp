@@ -54,6 +54,7 @@ def _runtime_code_fingerprint():
         "constants": _runtime_constant_signatures(),
         "functions": _runtime_function_signatures(globals()),
         "methods": _runtime_function_signatures(AbletonLiveMCP.__dict__),
+        "rpc_error_methods": _runtime_function_signatures(_RpcError.__dict__),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
@@ -94,6 +95,13 @@ def _constant_signature(value):
 
 class _EncodedResult(list):
     pass
+
+
+class _RpcError(KeyError):
+    def __init__(self, message, reason_code, **details):
+        KeyError.__init__(self, message)
+        self.reason_code = reason_code
+        self.details = details
 
 
 def _temp_file(name):
@@ -244,8 +252,14 @@ class AbletonLiveMCP(ControlSurface):
             return {"jsonrpc": "2.0", "id": req_id, "result": result}
         except Exception as exc:
             error = {"code": -32000, "message": str(exc)}
+            data = {
+                "reason_code": getattr(exc, "reason_code", "live_api_error"),
+                "error_type": exc.__class__.__name__,
+            }
+            data.update(getattr(exc, "details", {}) or {})
             if params.get("include_traceback"):
-                error["data"] = traceback.format_exc()
+                data["traceback"] = traceback.format_exc()
+            error["data"] = data
             return {"jsonrpc": "2.0", "id": req_id, "error": error}
 
     def _run_on_main(self, method, params):
@@ -1143,6 +1157,7 @@ class AbletonLiveMCP(ControlSurface):
             "scope": "live_exposed_automatable_parameters",
             "device": device_summary,
             "inventory_total": len(parameters),
+            "total": total,
             "matched_total": total,
             "offset": offset,
             "limit": limit,
@@ -1163,7 +1178,9 @@ class AbletonLiveMCP(ControlSurface):
             raise TypeError("value must be a finite number, not bool")
         if not math.isfinite(float(value)):
             raise ValueError("value must be finite; NaN and Infinity are not allowed")
-        domain = params.get("domain") or "raw"
+        if "domain" not in params:
+            raise ValueError("domain is required and must be raw or display")
+        domain = params.get("domain")
         if domain not in ("raw", "display"):
             raise ValueError("domain must be raw or display")
         before = self._parameter_summary(param)
@@ -1788,30 +1805,49 @@ class AbletonLiveMCP(ControlSurface):
     def _record_device_origin(self, item, requested_track, before, after):
         new_ids = [obj_id for obj_id in after["devices"] if obj_id not in before["devices"]]
         requested_path = before["tracks"].get(self._object_id(requested_track), {}).get("path") if requested_track is not None else None
-        if not new_ids:
-            return self._origin_unresolved("no_new_device", requested_target_path=requested_path)
-        if len(new_ids) != 1:
-            return self._origin_unresolved("multiple_new_devices",
-                new_device_count=len(new_ids), requested_target_path=requested_path)
-        current = after["devices"][new_ids[0]]
         try:
             uri = item.uri
         except Exception:
             uri = ""
         descriptor = self._plugin_descriptor(item)
+        event_id = uuid.uuid4().hex
+        load_event = {
+            "event_id": event_id,
+            "source": "live_browser",
+            "browser_uri": uri,
+            "browser_item_name": getattr(item, "name", ""),
+            "browser_item_is_device": bool(getattr(item, "is_device", False)),
+            "browser_item_is_loadable": bool(getattr(item, "is_loadable", False)),
+            "requested_target_path": requested_path,
+            "actual_target_path": None,
+            "target_changed": None,
+        }
+        common = {
+            "load_event": load_event,
+            "load_origin": dict(load_event),
+            "origin_kind": ("plugin" if descriptor["status"] == "resolved" else
+                "device" if getattr(item, "is_device", False) else "preset_or_content"),
+            "plugin_descriptor": descriptor,
+        }
+        if not new_ids:
+            return self._origin_unresolved("no_new_device",
+                requested_target_path=requested_path, **common)
+        if len(new_ids) != 1:
+            return self._origin_unresolved("multiple_new_devices",
+                new_device_count=len(new_ids), requested_target_path=requested_path,
+                **common)
+        current = after["devices"][new_ids[0]]
+        observation = self._origin_device_observation(current["object"])
+        load_event["actual_target_path"] = current["track_path"]
+        load_event["target_changed"] = bool(requested_path and requested_path != current["track_path"])
         record = {
             "status": "resolved",
-            "origin_id": uuid.uuid4().hex,
+            "origin_id": event_id,
             "runtime_session_id": self._runtime_session(),
             "browser_uri": uri,
-            "load_origin": {
-                "source": "live_browser",
-                "browser_uri": uri,
-                "browser_item_name": getattr(item, "name", ""),
-                "requested_target_path": requested_path,
-                "actual_target_path": current["track_path"],
-                "target_changed": bool(requested_path and requested_path != current["track_path"]),
-            },
+            "load_event": load_event,
+            "load_origin": dict(load_event),
+            "origin_kind": common["origin_kind"],
             "plugin_descriptor": descriptor,
             "device_id": current["id"],
             "loaded_path": current["path"],
@@ -1824,6 +1860,9 @@ class AbletonLiveMCP(ControlSurface):
             "track_id": current["track_id"],
             "track_path": current["track_path"],
             "identity_status": "same_native_object",
+            "loaded_observation": observation,
+            "current_observation": observation,
+            "drift": self._origin_drift(observation, observation),
         }
         if descriptor["status"] == "resolved":
             record.update({
@@ -1856,6 +1895,51 @@ class AbletonLiveMCP(ControlSurface):
         # continuity across them; equal names/paths never establish identity.
         left_ptr, right_ptr = getattr(left, "_live_ptr", None), getattr(right, "_live_ptr", None)
         return left_ptr is not None and left_ptr == right_ptr and bool(left_ptr)
+
+    def _origin_device_observation(self, device):
+        names = []
+        inventory_status = "available"
+        try:
+            parameters = list(device.parameters)
+            for index, parameter in enumerate(parameters):
+                try:
+                    name = parameter.original_name
+                except Exception:
+                    try:
+                        name = parameter.name
+                    except Exception:
+                        name = ""
+                names.append([index, name])
+        except Exception:
+            parameters = []
+            inventory_status = "unavailable"
+        payload = json.dumps(names, ensure_ascii=False, separators=(",", ":"))
+        return {
+            "name": getattr(device, "name", ""),
+            "class_name": getattr(device, "class_name", device.__class__.__name__),
+            "parameter_inventory": {
+                "status": inventory_status,
+                "count": len(parameters) if inventory_status == "available" else None,
+                "fingerprint": hashlib.sha256(payload.encode("utf-8")).hexdigest()
+                    if inventory_status == "available" else None,
+            },
+        }
+
+    def _origin_drift(self, loaded, current):
+        loaded_inventory = loaded.get("parameter_inventory") or {}
+        current_inventory = current.get("parameter_inventory") or {}
+        return {
+            "name": {
+                "changed": loaded.get("name") != current.get("name"),
+                "loaded": loaded.get("name"),
+                "current": current.get("name"),
+            },
+            "parameter_inventory": {
+                "changed": loaded_inventory.get("fingerprint") != current_inventory.get("fingerprint"),
+                "loaded": loaded_inventory,
+                "current": current_inventory,
+            },
+        }
 
     def _origin_current_path(self, obj):
         snapshot = self._origin_snapshot()
@@ -1946,6 +2030,12 @@ class AbletonLiveMCP(ControlSurface):
                 "track_id": current["track_id"],
                 "track_path": current["track_path"],
                 "identity_status": "same_native_object",
+            })
+            observation = self._origin_device_observation(current["object"])
+            loaded_observation = record.get("loaded_observation") or observation
+            record.update({
+                "current_observation": observation,
+                "drift": self._origin_drift(loaded_observation, observation),
             })
 
     def _rpc_load_device(self, params):
@@ -2135,9 +2225,18 @@ class AbletonLiveMCP(ControlSurface):
         if "id" in ref:
             obj_id = int(ref["id"])
             if obj_id not in self._objects:
-                raise KeyError("Unknown or stale object id %s; rerun get/search and use the new id" % obj_id)
+                raise _RpcError(
+                    "Unknown or stale object id %s; rerun get/search and use the new id" % obj_id,
+                    "unknown_object_id", object_id=obj_id)
             obj = self._objects[obj_id]
-            class_name = obj.__class__.__name__
+            try:
+                class_name = obj.__class__.__name__
+            except Exception as exc:
+                del self._objects[obj_id]
+                raise _RpcError(
+                    "Invalid Live proxy for object id %s; re-resolve the object" % obj_id,
+                    "invalid_live_proxy", object_id=obj_id,
+                    proxy_error_type=exc.__class__.__name__)
             if class_name == "Device" or class_name.endswith("PluginDevice") or class_name.startswith("MxDevice"):
                 try:
                     current = self._origin_snapshot()["devices"]
@@ -2145,9 +2244,21 @@ class AbletonLiveMCP(ControlSurface):
                     current = {}
                 if obj_id not in current:
                     del self._objects[obj_id]
-                    raise KeyError("Unknown or stale object id %s; device was deleted, replaced, or the Set was reloaded" % obj_id)
+                    raise _RpcError(
+                        "Unknown or stale object id %s; device was deleted, replaced, or the Set was reloaded" % obj_id,
+                        "stale_device_proxy", object_id=obj_id,
+                        possible_causes=["device_deleted", "device_replaced", "set_reloaded"])
             return obj
-        return self._resolve_path(ref.get("path") or "live_set")
+        path = ref.get("path") or "live_set"
+        try:
+            return self._resolve_path(path)
+        except _RpcError:
+            raise
+        except Exception as exc:
+            raise _RpcError(
+                "Could not resolve Live object path %s: %s" % (path, exc),
+                "object_path_resolution_failed", path=path,
+                proxy_error_type=exc.__class__.__name__)
 
     def _resolve_browser_item(self, ref):
         if not ref:
@@ -2368,14 +2479,60 @@ class AbletonLiveMCP(ControlSurface):
     def _device_summary(self, device):
         summary = self._object_summary(device, False)
         summary["name"] = getattr(device, "name", "")
-        try:
-            summary["class_name"] = device.class_name
-        except Exception:
-            pass
-        try:
-            summary["can_have_chains"] = device.can_have_chains
-        except Exception:
-            pass
+        unavailable = []
+        for attr in ("class_name", "class_display_name", "type", "is_active",
+                     "latency_in_samples", "latency_in_ms", "can_have_chains",
+                     "can_have_drum_pads", "can_compare_ab"):
+            try:
+                summary[attr] = getattr(device, attr)
+            except Exception:
+                unavailable.append(attr)
+        device_type = summary.get("type")
+        summary["type_name"] = {
+            0: "undefined", 1: "instrument", 2: "audio_effect", 4: "midi_effect",
+        }.get(device_type, "unknown" if device_type is not None else None)
+        class_name = summary.get("class_name") or device.__class__.__name__
+        is_plugin = class_name == "PluginDevice" or device.__class__.__name__.endswith("PluginDevice")
+        plugin_fields = []
+        if is_plugin:
+            for attr in ("is_editor_open", "selected_preset_index"):
+                try:
+                    summary[attr] = getattr(device, attr)
+                    plugin_fields.append(attr)
+                except Exception:
+                    unavailable.append(attr)
+            try:
+                summary["presets"] = list(device.presets)
+                plugin_fields.append("presets")
+            except Exception:
+                unavailable.append("presets")
+        if summary.get("can_compare_ab"):
+            try:
+                summary["is_using_compare_preset_b"] = device.is_using_compare_preset_b
+            except Exception:
+                unavailable.append("is_using_compare_preset_b")
+        descriptor = None
+        record = getattr(self, "_device_origins", {}).get(summary["id"])
+        if record and record.get("status") == "resolved":
+            descriptor = record.get("plugin_descriptor")
+        if is_plugin:
+            summary["plugin_descriptor"] = descriptor or {
+                "status": "unavailable",
+                "reason_code": "no_browser_origin_metadata",
+            }
+        summary["capabilities"] = {
+            "device_type": summary.get("type_name"),
+            "has_parameters": hasattr(device, "parameters"),
+            "has_chains": bool(summary.get("can_have_chains")),
+            "has_drum_pads": bool(summary.get("can_have_drum_pads")),
+            "compare_ab": summary.get("can_compare_ab"),
+            "plugin_presets": "presets" in plugin_fields,
+            "plugin_editor": "is_editor_open" in plugin_fields,
+            "selected_plugin_preset": "selected_preset_index" in plugin_fields,
+            "latency": ("latency_in_samples" in summary and "latency_in_ms" in summary),
+        }
+        if unavailable:
+            summary["unavailable_fields"] = unavailable
         return summary
 
     def _clip_summary(self, clip, slot_index):
@@ -2474,7 +2631,10 @@ class AbletonLiveMCP(ControlSurface):
             return {"truncated": True, "reason": "cycle"}
         if options["max_depth"] is not None and options["max_depth"] >= 0 and options["depth"] >= options["max_depth"]:
             return {"truncated": True, "reason": "max_depth"}
-        if isinstance(value, (list, tuple)):
+        is_string_vector = value.__class__.__name__.lower().endswith("stringvector")
+        if isinstance(value, (list, tuple)) or is_string_vector:
+            if is_string_vector:
+                value = list(value)
             limit = options["max_items"]
             values = value if limit is None or limit < 0 else value[:limit]
             child_options = dict(options)

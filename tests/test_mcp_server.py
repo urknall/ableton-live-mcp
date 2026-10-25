@@ -576,6 +576,19 @@ def test_parameter_set_tool_forwards_to_bridge():
     assert response["result"]["structuredContent"]["method"] == "parameter_set"
 
 
+def test_parameter_set_tool_requires_explicit_domain_before_bridge():
+    bridge = FakeBridge()
+    server = make_server(bridge)
+    response = server.handle({
+        "jsonrpc": "2.0",
+        "id": 360,
+        "method": "tools/call",
+        "params": {"name": "live_parameter_set", "arguments": {"ref": {"id": 99}, "value": 0.5}},
+    })
+    assert response["error"]["message"] == "arguments.domain is required"
+    assert bridge.calls == []
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_parameter_set_tool_rejects_nonfinite_numbers_before_bridge(value):
     bridge = FakeBridge()
@@ -584,7 +597,7 @@ def test_parameter_set_tool_rejects_nonfinite_numbers_before_bridge(value):
         "jsonrpc": "2.0",
         "id": 361,
         "method": "tools/call",
-        "params": {"name": "live_parameter_set", "arguments": {"ref": {"id": 99}, "value": value}},
+        "params": {"name": "live_parameter_set", "arguments": {"ref": {"id": 99}, "value": value, "domain": "raw"}},
     })
     assert "must be finite" in response["error"]["message"]
     assert bridge.calls == []
@@ -2610,6 +2623,31 @@ def test_bridge_error_omits_traceback_by_default(monkeypatch):
         client.request("ping")
     assert "bad call" in str(exc.value)
     assert "Traceback" not in str(exc.value)
+
+
+def test_bridge_error_preserves_structured_remote_error_data(monkeypatch):
+    monkeypatch.delenv("ABLETON_MCP_TRACEBACK", raising=False)
+    client = AbletonBridgeClient()
+    data = {"reason_code": "stale_device_proxy", "object_id": 42}
+    message = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32000, "message": "stale device", "data": data},
+    }
+    monkeypatch.setattr(client, "_read_line", lambda _sock, _max_bytes, _deadline=None: json.dumps(message).encode("utf-8"))
+
+    class FakeSocket:
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, _line):
+            pass
+
+    monkeypatch.setattr("socket.create_connection", lambda *_args, **_kwargs: FakeSocket())
+    with pytest.raises(AbletonBridgeError) as exc:
+        client.request("get")
+
+    assert exc.value.data == data
 
 
 def test_bridge_client_defaults_can_be_configured_from_env(monkeypatch):

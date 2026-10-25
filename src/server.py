@@ -197,7 +197,7 @@ def make_server(client: AbletonBridgeClient | None = None) -> StdioMcpServer:
         "coerce": {"type": "boolean"},
         "allow_inactive": {"type": "boolean"},
         **mutation_controls,
-    }, ["ref", "value"]), forward("parameter_set")))
+    }, ["ref", "value", "domain"]), forward("parameter_set")))
     server.add_tool(Tool("live_clip_notes", "List MIDI notes from a clip compactly.", schema({
         "ref": ref,
         "limit": {"type": "integer", "minimum": 0},
